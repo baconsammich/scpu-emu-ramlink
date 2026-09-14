@@ -1,0 +1,168 @@
+--- a/vice-3.10/src/scpu64/scpu64mem.c	2025-12-24 12:51:33
++++ b/vice-3.10/src/scpu64/scpu64mem.c	2026-09-14 04:05:47
+@@ -406,12 +406,20 @@
+ uint8_t scpu64_kernalshadow_read(uint16_t addr)
+ {
+     check_ba_read();
++    if (addr == 0xe0ab) {
++        log_message(LOG_DEFAULT, "SCPUTRACE kshadow $E0AB -> $%02x (sram[$%05x]) cfg=$%02x",
++                    mem_sram[0x8000 + addr], 0x8000 + addr, mem_config);
++    }
+     return mem_sram[0x8000 + addr];
+ }
+ 
+ uint8_t ram1_read(uint16_t addr)
+ {
+     check_ba_read();
++    if (addr == 0xe0ab) {
++        log_message(LOG_DEFAULT, "SCPUTRACE ram1_read $E0AB -> $%02x (sram[$%05x]) cfg=$%02x",
++                    mem_sram[0x10000 + addr], 0x10000 + addr, mem_config);
++    }
+     return mem_sram[0x10000 + addr];
+ }
+ 
+@@ -802,6 +810,62 @@
+         if (mem_reg_hwenable && !mem_reg_dosext) {
+             mem_reg_dosext = 1;
+             mem_pla_config_changed();
++            {
++                extern unsigned int reg_pc;
++                extern uint8_t scpu64_trap_read(uint16_t addr);
++                read_func_ptr_t f = mem_read_tab[mem_config][0xe0];
++                {
++                    static const int pages[7] = {0x00,0x10,0x60,0x80,0xa0,0xc0,0xe0};
++                    char buf[256]; int bi = 0; int q;
++                    for (q = 0; q < 7; q++) {
++                        read_func_ptr_t g = mem_read_tab[mem_config][pages[q]];
++                        const char *n =
++                            g == ram_read ? "R0" : g == ram1_read ? "R1" :
++                            g == ram_read_int ? "RC" :
++                            g == scpu64rom_scpu64_read ? "F8" :
++                            g == scpu64_kernalshadow_read ? "KS" :
++                            g == scpu64_roml_read ? "RL" :
++                            g == scpu64_romh_read ? "RH" :
++                            g == scpu64_ultimax_1000_7fff_read ? "U17" :
++                            g == scpu64_ultimax_a000_bfff_read ? "UAB" :
++                            g == scpu64_ultimax_c000_cfff_read ? "UCC" : "??";
++                        bi += snprintf(buf+bi, sizeof(buf)-bi, " $%02x00=%s", pages[q], n);
++                    }
++                    log_message(LOG_DEFAULT, "SCPUTRACE MAP cfg=$%02x%s", mem_config, buf);
++                    if (mem_config == 0xf7) {
++                        static int once = 0;
++                        if (!once) {
++                            static const unsigned probe[6] =
++                                {0x1234,0x6234,0x8234,0xa234,0xc234,0xe0ab};
++                            int z;
++                            once = 1;
++                            for (z = 0; z < 6; z++) {
++                                unsigned ad = probe[z];
++                                log_message(LOG_DEFAULT,
++                                  "SCPUTRACE PROBE $%04x -> $%02x  (ram0=$%02x ram1=$%02x "
++                                  "eprom=$%02x rlrom_a=$%02x)",
++                                  ad, mem_read_tab[0xf7][ad >> 8]((uint16_t)ad),
++                                  mem_sram[ad], mem_sram[0x10000 + ad],
++                                  scpu64rom_scpu64_rom[ad], mem_ram[ad]);
++                            }
++                        }
++                    }
++                }
++                log_message(LOG_DEFAULT,
++                    "SCPUTRACE DOSEXT-ON pc=$%04x cfg=$%02x  read($E0AB)=$%02x  "
++                    "handler=%s  bank1[$E0AB]=$%02x bank1[$60AB]=$%02x rom?=%02x",
++                    reg_pc, mem_config, f(0xe0ab),
++                    f == ram1_read ? "ram1_read" :
++                    f == scpu64_kernalshadow_read ? "kernalshadow" :
++                    f == ram_read ? "ram_read" :
++                    f == scpu64rom_scpu64_read ? "scpu64rom" :
++                    f == scpu64_romh_read ? "romh" :
++                    f == scpu64_roml_read ? "roml" :
++                    f == chargen_read ? "chargen" :
++                    f == scpu64_trap_read ? "trap_read" : "OTHER",
++                    mem_sram[0x10000 + 0xe0ab], mem_sram[0x10000 + 0x60ab],
++                    scpu64rom_scpu64_rom[0xe0ab & (SCPU64_SCPU64_ROM_MAXSIZE - 1)]);
++            }
+         }
+         break;
+     case 0xd0bd: /* same as 0xd0bf */
+@@ -835,8 +899,16 @@
+     return mem_sram[0x10000 + addr];
+ }
+ 
++extern unsigned int reg_pc;
++
+ static void scpu64_d200_store(uint16_t addr, uint8_t value)
+ {
++    if (addr >= 0xd200 && addr <= 0xd205) {
++        log_message(LOG_DEFAULT, "SCPUTRACE D2 store %04x = %02x  pc=$%04x  hwen=%d dosext=%d cfg=$%02x "
++                    "| bank1[$E0AB]=$%02x bank1[$60AB]=$%02x",
++                    addr, value, reg_pc, mem_reg_hwenable, mem_reg_dosext, mem_config,
++                    mem_sram[0x10000 + 0xe0ab], mem_sram[0x10000 + 0x60ab]);
++    }
+     if (mem_reg_hwenable || addr == 0xd27e) {
+         mem_sram[0x10000 + addr] = value;
+     }
+@@ -1109,12 +1181,38 @@
+     }
+ }
+ 
++/* --- SCPUTRACE: cartridge I/O log, PC-tagged, capped --- */
++static void scputrace_cart(int write, uint16_t addr, uint8_t value)
++{
++    extern unsigned int reg_pc;
++    static unsigned long n = 0;
++    if (++n <= 400)
++        log_message(LOG_DEFAULT, "SCPUTRACE CART %c $%04x = %02x  pc=$%04x",
++                    write ? 'W' : 'R', addr, value, reg_pc);
++    if (write && addr == 0xde39) {
++        static int once = 0;
++        if (!once) {
++            char b[256]; int k, bi = 0;
++            once = 1;
++            for (k = 0; k < 32; k++)
++                bi += snprintf(b + bi, sizeof(b) - bi, " %02x", mem_sram[0x10000 + 0x4ed0 + k]);
++            log_message(LOG_DEFAULT, "SCPUTRACE BANK1 $4ED0:%s", b);
++            bi = 0;
++            for (k = 0; k < 32; k++)
++                bi += snprintf(b + bi, sizeof(b) - bi, " %02x", mem_sram[0x4ed0 + k]);
++            log_message(LOG_DEFAULT, "SCPUTRACE BANK0 $4ED0:%s", b);
++            log_message(LOG_DEFAULT, "SCPUTRACE cfg=$%02x dosext=%d hwen=%d boot=%d",
++                        mem_config, mem_reg_dosext, mem_reg_hwenable, mem_reg_bootmap);
++        }
++    }
++}
++
+ uint8_t scpu64io_de00_read(uint16_t addr)
+ {
+     if (!dma_in_progress) {
+         scpu64_clock_read_stretch_io();
+     }
+-    return c64io_de00_read(addr); /* i/o read */
++    do { uint8_t v_ = c64io_de00_read(addr); scputrace_cart(0, addr, v_); return v_; } while (0); /* i/o read */
+ }
+ 
+ void scpu64io_de00_store(uint16_t addr, uint8_t value)
+@@ -1122,6 +1220,7 @@
+     if (!dma_in_progress) {
+         scpu64_clock_write_stretch_io_start();
+     }
++    scputrace_cart(1, addr, value);
+     c64io_de00_store(addr, value);
+     if (!dma_in_progress) {
+         scpu64_clock_write_stretch_io();
+@@ -1133,7 +1232,7 @@
+     if (!dma_in_progress) {
+         scpu64_clock_read_stretch_io();
+     }
+-    return c64io_df00_read(addr); /* i/o read */
++    do { uint8_t v_ = c64io_df00_read(addr); scputrace_cart(0, addr, v_); return v_; } while (0); /* i/o read */
+ }
+ 
+ void scpu64io_df00_store(uint16_t addr, uint8_t value)
+@@ -1141,6 +1240,7 @@
+     if (!dma_in_progress) {
+         scpu64_clock_write_stretch_io_start();
+     }
++    scputrace_cart(1, addr, value);
+     c64io_df00_store(addr, value);
+     switch (addr) {
+     case 0xdf01:

@@ -1,0 +1,259 @@
+# CMD SuperCPU — register reference
+
+**Source of truth: VICE's SCPU64 emulation** (`vice/src/scpu64/scpu64mem.c`,
+`scpu64_hardware_read` / `scpu64_hardware_store`), which is exercised by real
+SuperCPU software. A local copy is in `_vice/` (git-ignored).
+
+This document was originally derived from manuals and community documentation
+and was **wrong in several places**. Corrections, all confirmed against VICE:
+
+| Address | Was documented here as | Actually |
+|---|---|---|
+| `$D078` | VIC bank 0 optimization *(inferred)* | **SIMM configuration** — takes a value |
+| `$D079` | VIC bank 3 optimization *(inferred)* | **mirror of `$D07B`** (software 1MHz disable) |
+| `$D072` / `$D073` | absent | **system 1MHz enable / disable** |
+| `$D07D` | absent | mirror of `$D07F` |
+| `$D0Bx` | one mirrored status byte | **each address distinct, and several are writable** |
+| speed | one turbo flag | **three independent 1MHz requests** |
+
+The two I had marked *inferred* were the two that were wrong, which is at least
+the uncertainty landing where it belonged. Everything previously marked
+*confirmed* held up.
+
+## Write-sensitive switches
+
+Almost every SuperCPU register is a *write-sensitive switch*: storing any value
+triggers the action and the value is discarded. They cannot be read back. This
+is why BASIC toggles speed with `POKE 53370,0` — the `0` carries no meaning.
+
+### Optimization mode select
+
+Selects which writes get mirrored into C64 DRAM for the VIC-II. Requires the
+hardware register bank to be open (`$D07E`).
+
+| Address | Decimal | Function | Confidence |
+|---|---|---|---|
+| `$D074` | 53364 | VIC bank 2 (`$8000-$BFFF`) — documented as "GEOS optimization" | **confirmed** |
+| `$D075` | 53365 | VIC bank 1 (`$4000-$7FFF`) | **confirmed** |
+| `$D076` | 53366 | BASIC — mirror only `$0400-$07FF` | **confirmed** |
+| `$D077` | 53367 | No optimization — mirror everything | **confirmed** |
+| `$D078` | 53368 | **SIMM configuration** — takes a value, not a switch | **VICE** |
+| `$D079` | 53369 | **mirror of `$D07B`** — software 1MHz disable | **VICE** |
+
+There are only four optimization selects, not six. The mode is held in bits 7-6
+of an internal optimization register, taken from the low two bits of the
+address: `$D074` -> `00`, `$D075` -> `01`, `$D076` -> `10`, `$D077` -> `11`. The
+same register is readable and writable at `$D0B3` (v2) and `$D0B4`, and its low
+three bits — the "Z" and "B" flags — are OR'd into **every** read of the
+`$D0Bx` block, whichever address was used.
+
+The documented mode semantics, which drive `CWriteBuffer`:
+
+| Mode | Mirrors |
+|---|---|
+| DEFAULT | everything except zero page and stack |
+| NONE | everything, including zero page and stack |
+| BASIC | `$0400-$07FF` only |
+| FULL | nothing (C128 80-column: the VDC has its own RAM) |
+
+### Speed select
+
+Always available, whether or not the register bank is open — which is what makes
+`POKE 53370,0` usable straight from BASIC.
+
+| Address | Decimal | Function |
+|---|---|---|
+| `$D072` | 53362 | system 1MHz **enable** |
+| `$D073` | 53363 | system 1MHz **disable** |
+| `$D07A` | 53370 | software 1MHz **enable** (slow) |
+| `$D079`, `$D07B` | 53369, 53371 | software 1MHz **disable** (fast) |
+
+**There are three independent requests for 1MHz**, not one turbo flag: the
+system request, the software request, and the physical switch. The machine runs
+fast only when none of them is asserting:
+
+```
+fast = !( sys1MHz || soft1MHz || ( switchSlow && !hwRegsEnabled ) )
+```
+
+Note the last term. **The physical speed switch is honoured only while the
+hardware registers are disabled.** Software that opens the register bank takes
+the switch out of circuit entirely — a detail no manual mentions and which no
+amount of reading documentation would have produced.
+
+### Register bank enable
+
+| Address | Decimal | Function | Confidence |
+|---|---|---|---|
+| `$D07E` | 53374 | Enable hardware registers | **confirmed** |
+| `$D07F` | 53375 | Disable hardware registers (restore stock map) | **confirmed** |
+
+Documentation warns that software should toggle these promptly to avoid
+conflicts — while open, `$D074-$D079` are stolen from whatever else might decode
+there.
+
+## Status block, `$D0B0-$D0BF` (read, selected writes)
+
+**This is not a mirrored block** — each address carries distinct flags. Earlier
+notes here treated it as a single status byte; the SuperCPU 128 register list
+corrected that. Implemented in full.
+
+| Address | Dec | Contents | Confidence |
+|---|---|---|---|
+| `$D0B0` | 53424 | version / mode, bits 7-6 | **confirmed** |
+| `$D0B2` | 53426 | bit7 hardware registers enabled, bit6 system at 1MHz | **confirmed** |
+| `$D0B3` | 53427 | v2 enhanced optimization; readable always, writable while the bank is open | **partial** |
+| `$D0B4` | 53428 | bits 7-6 current optimization mode | **confirmed** |
+| `$D0B5` | 53429 | bit7 JiffyDOS switch, bit6 speed switch (1 = Normal) | **confirmed** |
+| `$D0B6` | 53430 | bit7 processor emulation mode, bit6 reset switch (v1) | **confirmed** |
+| `$D0B8` | 53432 | bit7 software speed flag, bit6 master speed flag (1 = Normal) | **confirmed** |
+| `$D0BA` | 53434 | SCPU-EMU video control, for one access after an `$A5` unlock | **emulator extension** |
+| `$D0BC` | 53436 | bit7 DOS extension mode, bit6 RAMLink registers | **confirmed** |
+
+On a physical SuperCPU `$D0B5` reports switches and VICE treats writes as a
+no-op. SCPU-EMU has no JiffyDOS switch input, so it intentionally adds one
+software control: writing `$D0B5` directly sets the virtual Jiffy switch from
+bit 7. Bit 6 remains read-only. From BASIC:
+
+```basic
+POKE 53429,128 : REM JIFFY ON
+POKE 53429,0   : REM JIFFY OFF
+```
+
+Do not open the hardware-register bank with `POKE 53374,0` for this. `$D07E`
+also swaps the active KERNAL window immediately, so it is not a safe BASIC
+configuration wrapper. The direct `$D0B5` write is deliberately the exception
+to the normal bank gating of writable `$D0Bx` controls.
+
+At Pi startup, `JIFFYDOS 1` or `JIFFYDOS 0` in `SCPU/scpu.cfg` sets the initial
+position; the built-in default is enabled. A direct `$D0B5` POKE overrides that
+position and persists across an emulated reset, matching a physical switch. A
+Pi reboot reads `scpu.cfg` again. Reset the emulated C64 after changing the
+switch so CMD's boot code installs the selected KERNAL image.
+
+### Runtime VIC / HDMI selection (SCPU-EMU)
+
+When the Pi booted with `VIDEO_MODE 1`, SCPU-EMU can hand presentation between
+its HDMI renderer and the physical VIC-II without rebooting. `$D0BA` keeps its
+ordinary decoded/no-effect CMD behavior unless it receives a one-shot `$A5`
+unlock. The immediately following access selects or queries the mode:
+
+```basic
+POKE 53434,165:POKE 53434,0:REM PHYSICAL VIC-II OUTPUT
+POKE 53434,165:POKE 53434,1:REM HDMI OUTPUT
+POKE 53434,165:PRINT PEEK(53434):REM 0=VIC, 1=HDMI
+```
+
+The query reports the mode whose handoff has actually completed, rather than a
+request still waiting to run. A switch is deferred while IEC is active and is
+performed at a frame boundary; repeated requests are debounced. Selecting the
+physical VIC parks the HDMI renderer on its last complete picture, restores
+physical mirroring, and requeues the current screen, bitmap/character data and
+enabled sprite shapes so real DRAM converges through the normal raster-aware
+scheduler. Returning to HDMI captures and completes a fresh frame before it
+stops physical mirroring.
+
+The extension is unavailable with `VIDEO_MODE 0`: deliberate knock commands are
+ignored and the established physical-VIC path is unchanged. The two-access
+unlock avoids permanently assigning undocumented `$D0BA` semantics that real
+SuperCPU software might encounter.
+
+`$D0B0` bits 7-6:
+
+| Value | Meaning |
+|---|---|
+| `00xxxxxx` | V2 in C128 mode |
+| `01xxxxxx` | V2 in C64 mode |
+| `11xxxxxx` | V1, no SuperCPU, or disabled |
+
+`$D0B4` bits 7-6:
+
+| Value | Optimization |
+|---|---|
+| `00xxxxxx` | VIC bank 2 / GEOS |
+| `01xxxxxx` | VIC bank 1 |
+| `10xxxxxx` | BASIC |
+| `11xxxxxx` | none |
+
+### Detection
+
+**Check bit 7 of `$D0BC` (53436).** It reads 1 on a stock C64/C128 because
+nothing decodes the address, and 0 on a SuperCPU. Then read `$D0B0` for the
+version.
+
+Resolved discrepancy: an earlier note here quoted the idiom as `PEEK(53433)`,
+which is `$D0B9`. Both the register list and the compatibility notes give
+`$D0BC`/53436, so 53433 appears to be a transposition in the scanned manual.
+SCPU-EMU answers on the whole block regardless, so either reading works.
+
+### The speed switch is a permission, not a command
+
+From the 1541 Ultimate discussion, and confirmed by the register list: the
+physical switch is *force 1MHz, or merely allow 20MHz*. In the NORMAL position
+the machine is locked to 1MHz and a write to `$D07B` is accepted and discarded.
+In TURBO it does not accelerate anything by itself — software still has to ask.
+
+Detection is independent of speed: "simply having the thing turned on is all
+that's required".
+
+### The KERNAL window moves when the registers open
+
+Enabling the hardware registers also moves where the bank-1 KERNAL image is
+served from, which is why software is told not to leave them enabled longer than
+necessary.
+
+An earlier version of this section said "SCPU-EMU does not do this". That was
+wrong — `applyKernalShadow()` sets `m_KernalShadowBase` to `$6000` or `$E000` as
+the register bank opens and closes
+([registers.h:267](../../Source/SuperCPU/registers.h#L267)).
+
+The mechanism is worth stating precisely, because it is easy to describe
+backwards. **Bank-0 `$E000-$FFFF` always serves the KERNAL.** What the register
+bank changes is *which bank-1 image* is mirrored there: with the registers
+closed, bank 1 `$E000-$FFFF`; with them open, a different image held at bank 1
+`$6000-$7FFF`, which CMD's own table labels **ALT. KERNAL**. So `$D07E` changes
+the code running at the KERNAL entry points, not merely which addresses decode.
+
+See [programming-the-scpu.md](programming-the-scpu.md#9-two-different-things-both-called-mirroring)
+for the full bank-1 shadow table.
+
+## Private RAM windows
+
+Not registers — genuine RAM inside the cartridge, which must never reach the C64.
+
+| Range | Size | Purpose | Confidence |
+|---|---|---|---|
+| `$D200-$D2FF` | 256 B | SuperCPU DOS / kernel scratch | **confirmed** |
+| `$D300-$D3FF` | 256 B | free for user programs | **confirmed** |
+
+Both pages are always readable, but writes normally take effect only while the
+hardware-register bank is open (`$D07E`).  `$D27E` is the sole exception: it is
+writable even while the bank is closed.  VICE implements these rules in
+`scpu64_d200_store` and `scpu64_d300_store`; closing the bank with `$D07F`
+write-protects the remaining locations without hiding their contents.
+
+The three ranges the SuperCPU steals inside I/O space are documented as
+`$D070-$D07F`, `$D0B0-$D0BF` and `$D200-$D3FF`. SCPU-EMU claims all of
+`$D0B0-$D0BF` and all of `$D200-$D3FF`; in `$D070-$D07F` it decodes the
+documented addresses and lets the rest fall through to the machine.
+
+A side effect worth noting: the compatibility notes record that programs writing
+to undocumented I/O *mirrors* fail on a SuperCPU, giving `$D220` (a VIC mirror)
+as the example. `$D220` falls inside the `$D200-$D2FF` private RAM window, so
+SCPU-EMU already swallows it rather than passing it to the VIC — matching the
+real hardware without any special case.
+
+## Sources
+
+- CMD SuperCPU 128 V2 User's Guide —
+  <https://archive.org/stream/CMD_SuperCPU_128_V2_Users_Guide/CMD_SuperCPU_128_V2_Users_Guide_djvu.txt>
+- c64-wiki, *SuperCPU* — <https://www.c64-wiki.com/wiki/SuperCPU>
+- SuperCPU programming info — <http://www.elysium.filety.pl/tools/supercpu/superprog.html>
+- Commodore Hacking #13, *Exploiting the 65C816S CPU* —
+  <http://mclauchlan.site.net.au/scott/C=Hacking/C-Hacking13/cpu.html>
+- SuperCPU 128 register list, c-128.freeforums.net —
+  <https://c-128.freeforums.net/thread/559/c128-super-cpu-registers>
+- SuperCPU compatibility notes — <https://supercpu.cbm8bit.com/comp.htm>
+- 1541 Ultimate issue #654, on detection and speed-switch semantics —
+  <https://github.com/GideonZ/1541ultimate/issues/654>
+- Scanned manuals — <https://www.zimmers.net/anonftp/pub/cbm/manuals/cmd/>

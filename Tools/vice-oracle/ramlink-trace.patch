@@ -1,0 +1,14 @@
+--- a/vice-3.10/src/c64/cart/ramlink.c	2025-12-24 12:51:33
++++ b/vice-3.10/src/c64/cart/ramlink.c	2026-09-14 03:53:31
+@@ -1462,7 +1462,11 @@
+ 
+ static void ramlink_io2_20_22_store(uint16_t addr, uint8_t value)
+ {
++    { static unsigned long n=0; extern unsigned int reg_pc;
++      if (++n <= 20 || (n % 100000)==0)
++        log_message(LOG_DEFAULT, "SCPUTRACE RLTRAP #%lu $%04x=%02x pc=$%04x", n, addr, value, reg_pc); }
+ 
++
+     IDBG((LOG, "--------------------"));
+ 
+     switch (addr & 0x03) {
